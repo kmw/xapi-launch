@@ -5,18 +5,11 @@ var Datastore = require('nedb');
 var DB = null;
 var hoganExpress = require('hogan-express');
 require('pretty-error').start();
+var mongoose = require('mongoose');
+var DAL = null;
+var config;
 async.series([
-	function loadDB(cb)
-	{
-		DB = new Datastore(
-		{
-			filename: './data.db',
-			autoload: true
-		})
-		DB = require("./server/DAL.js").setup(DB);
-		
-		cb();
-	},
+	
 	function loadConfig(cb)
 	{
 		if (require("./server/config.js").config === null)
@@ -27,7 +20,7 @@ async.series([
 				input: process.stdin,
 				output: process.stdout
 			});
-			rl.question('Please enter the LRS URL: ', function(LRS_Url)
+			rl.question('Please enter the LRS URL (ending with a slash): ', function(LRS_Url)
 			{
 				require("./server/config.js").config = {};
 				require("./server/config.js").config.LRS_Url = LRS_Url; 
@@ -37,28 +30,73 @@ async.series([
 					rl.question('Please enter the LRS Password: ', function(LRS_Password) 
 					{
 						require("./server/config.js").config.LRS_Password = LRS_Password;
-						// TODO: Log the answer in a database
-						console.log('This information has been saved to config.json. Please start the server again.');
-						require('fs').writeFileSync("./config.json",JSON.stringify(require("./server/config.js").config));
-						rl.close();
-						process.exit();
+						rl.question('Please enter the host (not ending in slash - eg. http://localhost:3000): ', function(host) 
+						{
+							require("./server/config.js").config.host = host;
+							rl.question('Enter the email for the administrator login: ', function(admin_email) 
+							{
+								require("./server/config.js").config.admin_email = admin_email;
+								// TODO: Log the answer in a database
+								rl.question('Enter the password for the administrator login: ', function(admin_pass) 
+								{
+									require("./server/config.js").config.admin_pass = admin_pass;
+									// TODO: Log the answer in a database
+									console.log('This information has been saved to config.json. Please start the server again.');
+									require('fs').writeFileSync("./config.json",JSON.stringify(require("./server/config.js").config));
+									rl.close();
+									process.exit();
+								});
+							});
+						});
 					});
 				});
 			});
 		}
 		else return cb();
+	},
+	function loadConfig(cb)
+	{
+		//serve static files
+		config = require("./server/config.js").config;
+		cb();
+	},
+	function loadDB(cb)
+	{
+		
+		mongoose.connect(config.connectionString);
+		DAL = require("./server/DAL.js").DAL;
+		var db = mongoose.connection;
+		db.once('open', function(err)
+		{
+			
+			DB = new DAL();
+			cb(err);
+		});
+		
 	}
 ], function startServer()
 {
-	//serve static files
-	var config = require("./server/config.js").config;
+	//for the address on the xapi route that proxies to the lrs, we need to be sure that to body parser
+	//middleware is not running. Otherwise it will interfere with the proxy.
+	function disableMiddlewareForProxy(fn)
+	{
+		return function(req,res,next)
+		{
+			var test = /\/launch\/(.*)\/xAPI\/(.*)/
+			var matches = test.exec(req.path);
+			if(!matches || matches && matches[2] == "statements")
+				return fn(req,res,next);
+			else return next()
 
+		}
+	}
 	app.use('/static', express.static('public'));
-	app.use(require("body-parser").json());
-	app.use(require("body-parser").urlencoded(
+	app.use(disableMiddlewareForProxy(require("body-parser").json()));
+	app.use(disableMiddlewareForProxy
+	( require("body-parser").urlencoded(
 	{
 		extended: true
-	}));
+	})));
 	app.use(require("cookie-parser")());
 	//use mustache templating
 	app.engine('html', hoganExpress);
@@ -68,7 +106,8 @@ async.series([
 	{
 		header: 'header',
 		footer: 'footer',
-		scripts: 'scripts'
+		scripts: 'scripts',
+		form:'forms/form'
 	});
 	app.set('layout', 'layout');
 	
@@ -77,8 +116,29 @@ async.series([
 		if(!res.locals)
 			res.locals = {};
 		res.locals.demoMode = config.demoMode;
+		res.locals.user = req.user;
 		next();
 	})
+
+	//hook up a nice function to allow a prettier string to be sent for errors and such
+	
+	app.use(function(req, res, next)
+	{
+		res.message = function(title, message)
+		{
+			if (!message)
+			{
+				message = title;
+				title = null;
+			}
+			res.render("message",
+			{
+				title: title,
+				message: message
+			});
+		}
+		next();
+	});
 	//setup various routes
 	require('./server/users.js').setup(app, DB);
 	require('./server/xapi.js').setup(app, DB);
@@ -87,10 +147,14 @@ async.series([
 	require('./server/media.js').setup(app, DB);
 	require('./server/mediaType.js').setup(app, DB);
 	require('./server/launch.js').setup(app, DB);
+	require('./server/files.js').setup(app, DB);
+	require('./server/protocol.js').setup(app, DB);
 	/*app.all("*",function(req,res,next)
 	{
 		res.redirect("/");
 	});*/
+
+	//This looks insane, but it's here because we want to test cross domain stuff locally.
 	app.listen(3000, function() {})
 
 	var app2 = express();

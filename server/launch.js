@@ -10,28 +10,67 @@ var ensureNotLoggedIn = require("./utils.js").ensureNotLoggedIn;
 var validateTypeWrapper = require("./utils.js").validateTypeWrapper;
 var lockedKeys = {};
 var config = require("./config.js").config;
+var checkOwner = require("./users.js").checkOwner;
 exports.setup = function(app, DAL)
 {
+
+    function courseGUIDToActivity(guid)
+    {
+
+        var def = {};
+        def.id = require("./config.js").config.host + "/courseContext/"+guid;
+        def.definition = {};
+        def.definition.name = {
+            "en-US": "Course Context"
+        };
+        def.definition.description = {
+            "en-US": "A grouping context for launches that are part of a course"
+        };
+        def.definition.type=  require("./config.js").config.host + "/courseContext/";
+        return def;
+    }
     //need some input on actual xAPI data here.
     function sendLaunchData(launch, req, res, reinit)
     {
         DAL.getUser(launch.email, function(err, user)
         {
+            if(!user || err)
+            {
+                return res.status(500).send("No User. Are you the admin? That wont work")
+            }
             DAL.getContentByKey(launch.contentKey, function(err, content)
             {
                 DAL.getMedia(launch.mediaKey, function(err, media)
                 {
                     var launchData = {};
+
                     launchData.actor = {
                         objectType: "Agent",
                         name: user.username,
-                        mbox: "mailto:" + user.email
-                    };
-                    var localServer = config.host || "http://localhost:3000/"; 
+                        account:
+                        {
+                            "homePage": (config.host || "http://localhost:3000") +"/",
+                            "name": user._id
+                        }
+                    }
+
+                    //allow user to override identity
+                    if(user.identity)
+                        launchData.actor = user.identity;
+                    
+                    var localServer = (config.host || "http://localhost:3000") +"/"; 
                     launchData.endpoint = localServer + "launch/" + launch.uuid + "/xAPI/";
                     launchData.contextActivities = {};
-                    launchData.contextActivities.parent = content.xapiForm();
-                    launchData.contextActivities.grouping = launch.xapiForm();
+                    launchData.contextActivities.parent = launch.xapiForm();
+                    if(launch.courseContext)
+                    {
+                        launchData.contextActivities.grouping = [content.xapiForm(), courseGUIDToActivity(launch.courseContext)]
+                    }
+                    else launchData.contextActivities.grouping = content.xapiForm();
+                    launchData.customData = {
+                        launch:launch.customData,
+                        content:content.customData
+                    }
                     launchData.sessionLength = content.sessionLength;
                     launchData.initializationCode = reinit ? 1 : 0;
                     //console.log("Sending launch data");
@@ -59,10 +98,13 @@ exports.setup = function(app, DAL)
         {
             if (content)
             {
+                console.log("query is", req.query);
                 DAL.createLaunchRecord(
                 {
                     email: req.user.email,
-                    contentKey: req.params.key
+                    contentKey: req.params.key,
+                    customData:req.query.launchData,
+                    courseContext:req.query.courseContext
                 }, function(err, launch)
                 {
                     if (err)
@@ -73,7 +115,7 @@ exports.setup = function(app, DAL)
                         var clientlaunch = launch.dbForm();
                         var clientContent = content.dbForm();
                         clientContent.publicKey = !!clientContent.publicKey; //be sure not to send the actual public key to the client
-                        res.locals.endpoint = config.host || "http://localhost:3000/"; 
+                        res.locals.endpoint = (config.host || "http://localhost:3000") +"/"; 
                         //the the content has a public key, use it to encrypt the data. Note that the student has access to
                         //the launch uuid in plaintext... is this ok?
                         if (content.publicKey)
@@ -117,7 +159,7 @@ exports.setup = function(app, DAL)
                     DAL.createLaunchRecord(
                     {
                         email: req.user.email,
-                        contentKey: content.key,
+                        contentKey: content._id,
                         mediaKey: req.params.key
                     }, function(err, launch)
                     {
@@ -130,7 +172,7 @@ exports.setup = function(app, DAL)
                             var clientlaunch = launch.dbForm();
                             var clientContent = content.dbForm();
                             clientContent.publicKey = !!clientContent.publicKey; //be sure not to send the actual public key to the client
-                            res.locals.endpoint = "http://localhost:3000/"; //this should come from the config file
+                            res.locals.endpoint = config.host + "/"; 
                             //the the content has a public key, use it to encrypt the data. Note that the student has access to
                             //the launch uuid in plaintext... is this ok?
                             if (content.publicKey)
@@ -349,6 +391,7 @@ exports.setup = function(app, DAL)
             });
         }
     }
+
     app.post("/launch/:key/xAPI/statements", validateLaunchSession(function(req, res, next)
     {
         //here, we need to validate the activity and append the context data
@@ -365,11 +408,21 @@ exports.setup = function(app, DAL)
                 postedStatement[i].context = {};
             }
             var contextActivities = postedStatement[i].context.contextActivities;
+            console.log(" req.launch.courseContext",  req.launch.courseContext )
             if (!contextActivities)
+            {
                 contextActivities = postedStatement[i].context.contextActivities = {
                     parent: req.launch.xapiForm(),
                     grouping: req.content.xapiForm()
                 };
+
+
+                if(req.launch.courseContext)
+                {
+                    console.log("Add course context");
+                    contextActivities.grouping = [ contextActivities.grouping, courseGUIDToActivity(req.launch.courseContext)]
+                }
+            }
             else
             {
                 //if the parent is exists
@@ -421,6 +474,10 @@ exports.setup = function(app, DAL)
                         {
                             contextActivities.grouping.push(req.content.xapiForm());
                         }
+                        if(req.launch.courseContext)
+                        {
+                            contextActivities.grouping.push(courseGUIDToActivity(req.launch.courseContext))
+                        }
                         if (req.media)
                         {
                             var included = false;
@@ -445,19 +502,37 @@ exports.setup = function(app, DAL)
                         {
                             contextActivities.grouping.push(req.media.xapiForm());
                         }
+                        if(req.launch.courseContext)
+                        {
+                            contextActivities.grouping.push(courseGUIDToActivity(req.launch.courseContext))
+                        }
                     }
                 }
                 else
                 {
                     if (!req.media)
-                        contextActivities.grouping = req.content.xapiForm();
+                    {
+                        if(req.launch.courseContext)
+                        {
+                            contextActivities.grouping = [req.content.xapiForm(),courseGUIDToActivity(req.launch.courseContext)];
+                        }
+                        else
+                            contextActivities.grouping = req.content.xapiForm();
+                    }
                     else
-                        contextActivities.grouping = [req.content.xapiForm(), req.media.xapiForm()];
+                    {
+                        if(req.launch.courseContext)
+                        {
+                            contextActivities.grouping = [req.content.xapiForm(),courseGUIDToActivity(req.launch.courseContext),req.media.xapiForm()];
+                        }
+                        else
+                            contextActivities.grouping = [req.content.xapiForm(), req.media.xapiForm()];
+                    }
                 }
             }
         }
-        var demoPrivateKey =  config.publicSigningKey || "-----BEGIN RSA PRIVATE KEY-----\nMIICXgIBAAKBgQCq480SFNQfy/HSkox2swxsan4w6zEXQGyMmSMyvxInEj26wuOY\nxj3N7E0GzX5qjKXS12ZjSi618XNgdFuJq4b68oyf5URiR1qrTa3EAK36hPsxtXnE\nO9fse0tcMI5gh5mVk378mTTOl5Kv7MLe9gBkjMveoqg3Tmu1It3Zmh8wZwIDAQAB\nAoGBAIHKOGNmPGHV9Nl4goRYorPpAeTHjGZbgNYcLPaK1g+ktAuXn2LWFfTDZxEm\nm7/zCLKk9Feu7OE0++sjFK7v/rh2D9gU+ocGljjp+uySZkpFovtrszs9mnT7iLMR\nNytenT/sZUsLA72PUP9MDryzMdW1dJi95PdstGJxugAy943hAkEA1uy4jpl6TDai\nITc7Z4IVnH/w2X8p4pkSQJtOtFm2RQlX7MIDNlNZJx4g2G8wc2juonoAIWnWjEnO\nMsKO4szGFwJBAMuMqEORZru0NgVXB2vkVYsZ6fZdcwZlavpaj2wI0miUEIb2dPLe\niNQhuGOL6wZTTIwpphUAp0hmfDOg79TuqjECQQCXiHmrWPzIRXDUWHvSw/32xKIM\nx0LB2EjtMlMwh1wimq7aaAQZxnRCR1TDJMoVZPNzrO7woA28BcGTOmfB8rzrAkEA\ngV83GyrxNuBFbYNxDhwkWrLvx0yB7VDMe67PdYTt5tYk4wMGNc9G/D0qaurlSDHt\ndzCJhNPTfurUiiQCCz5eIQJACZgrfK3pe8YzkmCWJMzFUgcX7O/8qU2aSuP+xkMI\nCvTe0zjWjU7wB5ftdvcQb6Pf7NCKwYJyMgwQHZttHmb4WQ==\n-----END RSA PRIVATE KEY-----";
-        var demoPublicKey = config.privateSigningKey || "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCq480SFNQfy/HSkox2swxsan4w\n6zEXQGyMmSMyvxInEj26wuOYxj3N7E0GzX5qjKXS12ZjSi618XNgdFuJq4b68oyf\n5URiR1qrTa3EAK36hPsxtXnEO9fse0tcMI5gh5mVk378mTTOl5Kv7MLe9gBkjMve\noqg3Tmu1It3Zmh8wZwIDAQAB\n-----END PUBLIC KEY-----";
+        var demoPrivateKey =  config.privateSigningKey || "-----BEGIN RSA PRIVATE KEY-----\nMIICXgIBAAKBgQCq480SFNQfy/HSkox2swxsan4w6zEXQGyMmSMyvxInEj26wuOY\nxj3N7E0GzX5qjKXS12ZjSi618XNgdFuJq4b68oyf5URiR1qrTa3EAK36hPsxtXnE\nO9fse0tcMI5gh5mVk378mTTOl5Kv7MLe9gBkjMveoqg3Tmu1It3Zmh8wZwIDAQAB\nAoGBAIHKOGNmPGHV9Nl4goRYorPpAeTHjGZbgNYcLPaK1g+ktAuXn2LWFfTDZxEm\nm7/zCLKk9Feu7OE0++sjFK7v/rh2D9gU+ocGljjp+uySZkpFovtrszs9mnT7iLMR\nNytenT/sZUsLA72PUP9MDryzMdW1dJi95PdstGJxugAy943hAkEA1uy4jpl6TDai\nITc7Z4IVnH/w2X8p4pkSQJtOtFm2RQlX7MIDNlNZJx4g2G8wc2juonoAIWnWjEnO\nMsKO4szGFwJBAMuMqEORZru0NgVXB2vkVYsZ6fZdcwZlavpaj2wI0miUEIb2dPLe\niNQhuGOL6wZTTIwpphUAp0hmfDOg79TuqjECQQCXiHmrWPzIRXDUWHvSw/32xKIM\nx0LB2EjtMlMwh1wimq7aaAQZxnRCR1TDJMoVZPNzrO7woA28BcGTOmfB8rzrAkEA\ngV83GyrxNuBFbYNxDhwkWrLvx0yB7VDMe67PdYTt5tYk4wMGNc9G/D0qaurlSDHt\ndzCJhNPTfurUiiQCCz5eIQJACZgrfK3pe8YzkmCWJMzFUgcX7O/8qU2aSuP+xkMI\nCvTe0zjWjU7wB5ftdvcQb6Pf7NCKwYJyMgwQHZttHmb4WQ==\n-----END RSA PRIVATE KEY-----";
+        var demoPublicKey = config.publicSigningKey || "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCq480SFNQfy/HSkox2swxsan4w\n6zEXQGyMmSMyvxInEj26wuOYxj3N7E0GzX5qjKXS12ZjSi618XNgdFuJq4b68oyf\n5URiR1qrTa3EAK36hPsxtXnEO9fse0tcMI5gh5mVk378mTTOl5Kv7MLe9gBkjMve\noqg3Tmu1It3Zmh8wZwIDAQAB\n-----END PUBLIC KEY-----";
         var jwt = require('jsonwebtoken');
         var FormData = require('form-data');
         var form = new FormData();
@@ -578,11 +653,78 @@ exports.setup = function(app, DAL)
             }));
         })
     }));
+    function dealWithMore(body,res,key)
+    {
+       
+        try{
+            if(body.more)
+                body.more = "/launch/"+key+"/xAPI/more" + body.more;
+            res.send(body);   
+        }catch(E)
+        {
+            res.send(body);
+        }
+    }
+    app.get("/launch/:key/xAPI/more*", validateLaunchSession(function(req, res, next)
+    {
+        var endpoint = require('url').parse(req.lrsConfig.endpoint);
+        endpoint.pathname = null;
+        endpoint = require('url').format(endpoint);
+
+        var search = require('url').parse(req.originalUrl).search;
+        var proxyAddress = endpoint + (req.params[0] ? req.params[0] : "" ) + (search ? search :"");
+        console.log(proxyAddress)
+        
+        req.pipe(require('request')(proxyAddress).auth(req.lrsConfig.username, req.lrsConfig.password, true)).on('response', function( lrsRes)
+        {
+                lrsRes.__proto__ = require('express').request;
+          
+                require("body-parser").json({limit:"500kb"})(lrsRes, res, function(err) {
+                    if(err)
+                        console.log(err);
+                    dealWithMore(lrsRes.body, res, req.params.key)
+                });
+        })
+    }));
+    app.get("/launch/:key/xAPI/statements*", validateLaunchSession(function(req, res, next)
+    {
+        var search = require('url').parse(req.originalUrl).search;
+        var proxyAddress = req.lrsConfig.endpoint + "statements" + req.params[0]  + (search? search : "");
+        console.log(proxyAddress)
+        req.pipe(require('request')(proxyAddress).auth(req.lrsConfig.username, req.lrsConfig.password, true).on('response', function(lrsRes)
+        {
+                lrsRes.__proto__ = require('express').request;
+          
+                require("body-parser").json({limit:"5000kb"})(lrsRes, res, function(err) {
+                    if(err)
+                        console.log(err);
+                    dealWithMore(lrsRes.body, res, req.params.key)
+                });
+           
+        }));
+    }));
     app.all("/launch/:key/xAPI/*", validateLaunchSession(function(req, res, next)
     {
-        //passthrough all other XAPI statements
-        var proxyAddress = config.LRS_Url + req.params[0];
-        req.pipe(require('request')(proxyAddress)).pipe(res);
+        //passthrough all other XAPI commands
+
+            var search = require('url').parse(req.originalUrl).search;
+            var proxyAddress = req.lrsConfig.endpoint + req.params[0]  + (search? search : "");
+            console.log(proxyAddress)
+            var request = require('request');
+            req.pipe( request({
+                  url: proxyAddress,
+                  method: req.method
+              }, function(error, response, body){
+               
+                  console.error(error);
+                
+              }).auth(req.lrsConfig.username,req.lrsConfig.password,true)      ).on('error',function(e){
+                console.log(e);
+            }).pipe( res );
+
+
+         //   req.pipe(require('request')(proxyAddress).auth(req.lrsConfig.username,req.lrsConfig.password,true).on("error",function(e){console.log(e); res.status(500).send(err)})).pipe(res).on("error",function(e){console.log(e); res.status(500).send(err)});
+        
     }));
     app.get("/launches/:key", function(req, res, next)
     {

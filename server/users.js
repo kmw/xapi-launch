@@ -5,17 +5,119 @@ var LocalStrategy = require("passport-local");
 var requirejs = require('requirejs');
 var session = require('express-session')
 var async = require("async");
-var ensureLoggedIn = require("./utils.js").ensureLoggedIn;
-var ensureNotLoggedIn = require("./utils.js").ensureNotLoggedIn;
+var strings  = require("./strings.js");
+
+var user = require('./ODM/schemas/userAccount.js');
 var validateTypeWrapper = require("./utils.js").validateTypeWrapper;
 var config = require("./config.js").config;
 var blockInDemoMode = require("./utils.js").blockInDemoMode;
+var CryptoJS = require("../public/scripts/pbkdf2.js").CryptoJS;
+
+var email = require("./email.js");
+function userHasRole (role)
+{
+    return function(req, res, next)
+    {
+        if(!req.user) return res.status(401).send("not authorized");
+        if (req.user.hasRole(role))
+            next();
+        else
+            res.status(401).send("not authorized");
+    }
+}
+
+exports.userHasRole = userHasRole
+
 requirejs.config(
 {
     nodeRequire: require
 });
 
 
+var ensureLoggedIn = function(req, res, next) {
+    if (!req.user) {
+        res.redirect("/users/login?r=" + encodeURIComponent(req.url))
+    } else
+        next();
+}
+
+var ensureNotLoggedIn = function(req, res, next) {
+    if (req.user) {
+        res.redirect("/")
+    } else
+        next();
+}
+
+
+exports.checkOwner = function(obj,user)
+{
+    if(user == adminUser) return true;
+    if(!obj || !user ) return false;
+    if(obj.owner == user.email)
+        return true;
+    return false;
+}
+var checkOwner = require("./users.js").checkOwner;
+
+function hash(pass,salt)
+{
+     var key = CryptoJS.PBKDF2(pass, salt,
+                        {
+                            keySize: 512 / 32,
+                            iterations: 100
+                        });
+     return key.toString();
+}
+
+try{
+var adminUser = function()
+{
+    this.username = "Admin";
+    this.email = config.admin_email;
+    this.salt = "";
+    this.password = hash(config.admin_pass,"");
+    this.dataType = "userAccount";
+    this.roles = ["admin","creator"];
+    this.verifiedEmail = true;
+    Object.defineProperty(this,"isAdmin",{
+        get:function()
+        {
+            return this.roles.indexOf("admin") !== -1
+        }
+    })
+    Object.defineProperty(this,"isCreator",{
+        get:function()
+        {
+            return this.roles.indexOf("creator") !== -1
+        }
+    })
+
+    this.addRole = function(role)
+    {
+        
+    }
+    this.removeRole = function(role)
+    {
+      
+    }
+    this.hasRole = function(role)
+    {
+      return true;
+    }
+    this.save = function(cb)
+    {
+        if(cb)
+            process.nextTick(cb);
+    }
+    return this;
+}.apply({});
+} catch(e)
+{
+    console.log("error creating admin user. does the config file include admin_pass and admin_email?")
+}
+
+
+exports.adminUser = adminUser;
 exports.setup = function(app, DAL)
 {
     app.use(session(
@@ -29,29 +131,57 @@ exports.setup = function(app, DAL)
     passport.use(new LocalStrategy(
         function(username, password, done)
         {
-            DAL.getUser(username, function(err, user)
+            if (username == config.admin_email)
             {
-                if (err)
+                console.log("admin login");
+                console.log(password);
+                if (password == adminUser.password)
                 {
-                    done(null, false);
-                    return;
-                }
-                if (user)
-                {
-                    if (user.password == password)
-                    {
-                        done(null, user);
-                    }
-                    else
-                    {
-                        done(null, false)
-                    }
+                    return done(null, adminUser);
                 }
                 else
                 {
-                    done(null, false);
+                    return done(null, false);
                 }
-            })
+            }
+            else
+            {
+                DAL.getUser(username.toLowerCase(), function(err, user)
+                {
+                    if (err)
+                    {
+                        done(null, false);
+                        return;
+                    }
+                    if (user)
+                    {
+                        console.log("got user")
+                        if (user.password == password)
+                        {
+                            done(null, user);
+                        }
+                        else
+                        {   
+                            console.log("not password")
+                            console.log(user.passwordResetKey,password);
+                            if (user.passwordResetKey == password)
+                            {
+                                console.log("is reset key");
+                                done(null, user,
+                                    {
+                                        resetLogin: true
+                                    }) //pass along the info that the user used the temp credentials
+                            }
+                            else
+                                done(null, false)
+                        }
+                    }
+                    else
+                    {
+                        done(null, false);
+                    }
+                })
+            }
         }
     ));
     app.use(passport.initialize());
@@ -64,13 +194,17 @@ exports.setup = function(app, DAL)
     });
     passport.deserializeUser(function(id, done)
     {
+        if(id == config.admin_email)
+        {
+            return done(null,adminUser);
+        }
         DAL.getUser(id, function(err, user)
         {
             done(err, user);
         });
     });
 
-    if(config.demoMode)
+    if(config && config.demoMode)
     {
         app.use(function createMockUser(req, res, next)
         {
@@ -134,6 +268,11 @@ exports.setup = function(app, DAL)
     });
     app.get("/users/salt", blockInDemoMode,  function(req, res, next)
     {
+        if(req.query.email == config.admin_email)
+        {
+            res.status(200).send(adminUser.salt);
+            return;
+        }
         DAL.getUser(req.query.email, function(err, user)
         {
             if (user && !err)
@@ -159,36 +298,47 @@ exports.setup = function(app, DAL)
         });
     }));
 
-    app.get("/users/me",blockInDemoMode,  ensureLoggedIn(function(req, res, next)
+    app.get("/users/me",blockInDemoMode,  ensureLoggedIn , function(req, res, next)
     {
         res.render("editAccount",{
-            user:req.user
+            user:req.user,
+            parsedIdentity: req.user.identity ? JSON.stringify(req.user.identity, null, 1 ) : null
         })
-    }));
-    app.post("/users/edit",blockInDemoMode,  ensureLoggedIn(validateTypeWrapper(schemas.editAccountRequest, function(req, res, next)
+    });
+    app.post("/users/edit",blockInDemoMode,  ensureLoggedIn, validateTypeWrapper(schemas.editAccountRequest, function(req, res, next)
     {
         if(!req.user)
             return res.status(404).send("User not found");
         req.user.lrsConfig = req.body.lrsConfig;
+        
+        if(req.body.identity)
+        {
+            try{
+                req.user.identity = JSON.parse(req.body.identity)
+            }catch(e)
+            {
+              return res.status(400).send("Bad JSON in Identity")
+            }
+        }
         req.user.save(function(err)
         {
             res.status(200).send("200 - OK");
         })
-    })));
+    }));
 
-    app.get('/users/logout',blockInDemoMode,  ensureLoggedIn(function(req, res, next)
+    app.get('/users/logout',blockInDemoMode,  ensureLoggedIn, function(req, res, next)
     {
         req.logout();
         res.redirect("/");
-    }));
-    app.get("/users/launches/:guid/delete", ensureLoggedIn(function(req, res, next)
+    });
+    app.get("/users/launches/:guid/delete", ensureLoggedIn, function(req, res, next)
     {
         DAL.getLaunchByGuid(req.params.guid, function(err, launch)
         {
             if (launch && launch.email == req.user.email)
             {
 
-                launch.delete(function(err)
+                launch.remove(function(err)
                 {
                     res.redirect("/users/launches");
                 })
@@ -198,8 +348,8 @@ exports.setup = function(app, DAL)
                 res.redirect("/users/launches");
             }
         })
-    }))
-    app.get('/users/launches', ensureLoggedIn(function(req, res, next)
+    })
+    app.get('/users/launches', ensureLoggedIn, function(req, res, next)
     {
 
         DAL.getAllUsersLaunch(req.user.email, function(err, results)
@@ -255,8 +405,8 @@ exports.setup = function(app, DAL)
             })
 
         })
-    }));
-    app.get("/users/content", ensureLoggedIn(function(req, res, next)
+    });
+    app.get("/users/content", ensureLoggedIn ,function(req, res, next)
     {
         DAL.getAllMediaTypes(function(err, types)
         {
@@ -274,8 +424,8 @@ exports.setup = function(app, DAL)
                     //console.log(results);
                     for (var i in results)
                     {
-                        results[i].virtuals.launchKey = results[i].key;
-                        results[i].virtuals.owned = !!req.user && results[i].owner == req.user.email;
+                        results[i].virtuals.launchKey = results[i]._id;
+                        results[i].virtuals.owned = !!req.user && checkOwner(results[i],req.user);
                         for (var j in types)
                             if (types[j].uuid == results[i].mediaTypeKey)
                                 results[i].virtuals.mediaType = types[j];
@@ -285,10 +435,10 @@ exports.setup = function(app, DAL)
                 }
             })
         })
-    }));
+    });
 
 
-    app.get("/users/media", ensureLoggedIn(function(req, res, next)
+    app.get("/users/media", ensureLoggedIn,function(req, res, next)
     {
 
 
@@ -306,8 +456,8 @@ exports.setup = function(app, DAL)
                 {
                     for (var i in results)
                     {
-                        results[i].virtuals.launchKey = results[i].key;
-                        results[i].virtuals.owned = !!req.user && results[i].owner == req.user.email;
+                        results[i].virtuals.launchKey = results[i]._id;
+                        results[i].virtuals.owned = !!req.user && checkOwner(results[i],req.user);
                         results[i].virtuals.resultLink = "/results/" + results[i].virtuals.launchKey;
                         for (var j in types)
                         {
@@ -320,7 +470,7 @@ exports.setup = function(app, DAL)
                 }
             })
         });
-    }));
+    });
 
 
     app.post('/users/login',blockInDemoMode,  function(req, res, next)
@@ -340,6 +490,11 @@ exports.setup = function(app, DAL)
             {
                 return res.status(400).send("login failed");
             }
+            //Login fails if the user gave the right password, but email is not yet verified
+            if (!user.verifiedEmail)
+            {
+                return res.status(400).send("Account is not verified");
+            }
             //console.log("login");
             req.login(user, function(err)
             {
@@ -349,8 +504,135 @@ exports.setup = function(app, DAL)
                     return next(err);
                 }
                 req.user = user;
+
+                if (info && info.resetLogin)
+                {
+                    req.session.mustResetPassword = true;
+                }
+                else
+                {
+                    //if the user logged in with their normal password, then clear the reset key
+                    user.passwordResetKey = null;
+                    user.save();
+                }
+
                 return res.status(200).send("login ok");
             });
         })(req, res, next);
     });
+
+
+    var validateEmail = function(req, res, next)
+    {
+        //Get user by verify code
+        user.findOne(
+        {
+            verifyCode: req.params[0]
+        }, function(err, user)
+        {
+            if (!err && user && !user.verifiedEmail)
+            {
+                //mark them as verified, save, and go ahead and log them in
+                user.verifiedEmail = true;
+                return user.save(function()
+                {
+                    req.login(user, function(err)
+                    {
+                        res.redirect("/");
+                    });
+                })
+            }
+            else if (user && user.verifiedEmail)
+            {
+                res.status(400).send(strings.already_verified);
+            }
+            else
+            {
+                res.status(400).send(strings.verified_code_error);
+            }
+        });
+    }
+
+    var resendValidation = function(req, res, next)
+    {
+        res.status(200).send(strings.validation_sent);
+        user.findOne(
+        {
+            email: req.body.email
+        }, function(err, user)
+        {
+            if (!err && user)
+            {
+                //Don't bother for verified accounts
+                if (!user.verifiedEmail)
+                    email.sendEmailValidateEmail(user)
+            }
+        });
+    }
+
+    var resetPassword = function(req, res, next)
+    {
+        if(req.user.checkPassword(req.body.oldpassword) ||  req.user.checkResetKey(req.body.oldpassword))
+        {
+            req.user.resetPassword(req.body.password);
+            delete req.session.mustResetPassword;
+            res.status(200).send("Password reset");
+        }else
+        {
+            res.status(500).send("Your original password was not correct");
+        }
+        
+    }
+    var forgotPassword = function(req, res, next)
+    {
+        user.findOne(
+        {
+            email: req.body.email
+        }, function(err, user)
+        {
+            if (!err && user)
+            {
+                //Can't reset the password for the account until the email is verified. Prompt the user to revalidate the email.
+                if (!user.verifiedEmail)
+                {
+                    return res.status(200).send(strings.login_unvalidated)
+                }
+                else
+                {
+                    //Generate a new temp credential
+                    var plaintext = user.forgotPassword();
+                    email.sendForgotPasswordEmail(user,plaintext);
+                    return res.status(200).send(strings.password_reset_sent)
+                }
+            }
+            else
+            {
+                //don't let the output allow fishing to detect existance of account. Send this if account not found.
+                res.status(200).send(strings.password_reset_sent)
+            }
+        });
+    }
+    function renderPage(title, file)
+    {
+        return function(req, res, next)
+        {
+            res.locals.pageTitle = title;
+            res.render(file,{})
+        }
+    }
+    app.get("/users/forgotPassword", ensureNotLoggedIn, renderPage("Reset Password","forgotPassword"));
+    //app.get("/users/deleteAccount", utils.ensureLoggedIn,admin.cannotBeAdmin, renderPage("Delete Account","deleteAccount"));
+    app.get("/users/resetPassword", ensureLoggedIn, renderPage("Reset Password","resetPassword"));
+    app.get("/users/validateEmail", ensureNotLoggedIn,renderPage("Enter Validataion Code","manualValidationCodeEntry"));
+    app.get('/users/validateEmail/*', ensureNotLoggedIn, validateEmail);
+    app.get("/users/resendValidation", ensureNotLoggedIn, renderPage("Resend Validation Code","resendValidation"));
+    //Resend the validation email. NOTE: don't reset the validation key here
+    app.post('/users/resendValidation', ensureNotLoggedIn, resendValidation);
+    //Update the users password. Takes the new password in plaintext in the body. Also generates a new salt
+    app.post('/users/resetPassword', ensureLoggedIn, resetPassword)
+    //Delete the account.
+    //app.post('/users/deleteAccount', ensureLoggedIn, deleteAccount)
+   // //Allow the user to say they forgot their password. Take the email address as post data.
+    app.post('/users/forgotPassword', ensureNotLoggedIn, forgotPassword)
+
 }
